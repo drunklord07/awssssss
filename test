@@ -1,0 +1,516 @@
+import boto3
+import pandas as pd
+import json
+import os
+import base64
+import datetime
+import time
+from botocore.exceptions import ClientError
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- CONFIGURATION ---
+OUTPUT_EXCEL = "ec2_ultimate_inventory.xlsx"
+DATA_DIR = "ec2_instance_details"  # Folder for detailed JSON files
+MAX_WORKERS = 20  # Adjust based on your internet connection/CPU
+
+# Create output directory
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Helper to handle datetime objects in JSON dumps"""
+    def default(self, o):
+        if isinstance(o, (datetime.date, datetime.datetime)):
+            return o.isoformat()
+        return super(DateTimeEncoder, self).default(o)
+
+
+def get_account_id():
+    """Fetches the current AWS Account ID."""
+    return boto3.client("sts").get_caller_identity()["Account"]
+
+
+def get_all_regions():
+    """Returns a list of all enabled regions for this account."""
+    ec2 = boto3.client("ec2", region_name="us-east-1")
+    try:
+        response = ec2.describe_regions(AllRegions=False)
+        return [r["RegionName"] for r in response["Regions"]]
+    except ClientError:
+        return ["us-east-1"]
+
+
+def save_instance_detail(filename_base, full_data):
+    """Saves the full data dictionary to a JSON file."""
+    filename = f"{filename_base}.json"
+    filepath = os.path.join(DATA_DIR, filename)
+
+    try:
+        with open(filepath, "w") as f:
+            json.dump(full_data, f, indent=4, cls=DateTimeEncoder)
+        return filename
+    except Exception as e:
+        return f"Error Saving: {str(e)}"
+
+
+def audit_region(region, account_id):
+    """
+    Worker function: Deeply audits one region.
+    """
+    ec2 = boto3.client("ec2", region_name=region)
+    instance_rows = []
+
+    try:
+        # --- SG CACHE (per region) ---
+        sg_cache = {}
+        try:
+            sg_paginator = ec2.get_paginator("describe_security_groups")
+            for sg_page in sg_paginator.paginate():
+                for sg in sg_page["SecurityGroups"]:
+                    sg_cache[sg["GroupId"]] = sg
+        except ClientError:
+            sg_cache = {}
+
+        # --- VOLUME ENCRYPTION CACHE (per region) ---
+        vol_encrypted = {}
+        try:
+            vol_paginator = ec2.get_paginator("describe_volumes")
+            for vol_page in vol_paginator.paginate():
+                for vol in vol_page["Volumes"]:
+                    vol_encrypted[vol["VolumeId"]] = bool(vol.get("Encrypted", False))
+        except ClientError:
+            vol_encrypted = {}
+
+        paginator = ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page["Reservations"]:
+                for instance in reservation["Instances"]:
+
+                    # --- 1. BASIC IDENTIFIERS ---
+                    inst_id = instance["InstanceId"]
+                    # Construct ARN: arn:aws:ec2:region:account-id:instance/instance-id
+                    arn = f"arn:aws:ec2:{region}:{account_id}:instance/{inst_id}"
+
+                    # Extract Name Tag
+                    inst_name = "NoName"
+                    tags_formatted = []
+                    if "Tags" in instance:
+                        for t in instance["Tags"]:
+                            tags_formatted.append(f"{t['Key']}={t['Value']}")
+                            if t["Key"] == "Name":
+                                inst_name = t["Value"]
+
+                    # Sanitize name for filename
+                    safe_name = "".join([c if c.isalnum() else "-" for c in inst_name])
+
+                    # --- 2. DEEP DIVE: USER DATA (Startup Script) ---
+                    user_data_decoded = "None"
+                    has_user_data = False
+                    try:
+                        ud_resp = ec2.describe_instance_attribute(
+                            InstanceId=inst_id, Attribute="userData"
+                        )
+                        if (
+                            "UserData" in ud_resp
+                            and "Value" in ud_resp["UserData"]
+                            and ud_resp["UserData"]["Value"]
+                        ):
+                            user_data_decoded = base64.b64decode(
+                                ud_resp["UserData"]["Value"]
+                            ).decode("utf-8", errors="ignore")
+                            has_user_data = True
+                    except ClientError:
+                        user_data_decoded = "AccessDenied or Error"
+
+                    # --- 3. DEEP DIVE: STATUS CHECKS ---
+                    system_status = "Unknown"
+                    instance_status = "Unknown"
+                    try:
+                        stat_resp = ec2.describe_instance_status(
+                            InstanceIds=[inst_id],
+                            IncludeAllInstances=True,
+                        )
+                        if stat_resp["InstanceStatuses"]:
+                            s = stat_resp["InstanceStatuses"][0]
+                            system_status = s["SystemStatus"]["Status"]
+                            instance_status = s["InstanceStatus"]["Status"]
+                    except ClientError:
+                        pass
+
+                    # --- 4. SECURITY GROUPS (with cache) ---
+                    sg_ids = [
+                        sg["GroupId"]
+                        for sg in instance.get("SecurityGroups", [])
+                    ]
+                    sg_full_details = []
+                    if sg_ids:
+                        for sg_id in sg_ids:
+                            sg_obj = sg_cache.get(
+                                sg_id,
+                                {"GroupId": sg_id, "Error": "Not found in cache"},
+                            )
+                            sg_full_details.append(sg_obj)
+
+                    # Nicely formatted SG string for Excel
+                    sg_str_elems = []
+                    for sg in instance.get("SecurityGroups", []):
+                        gid = sg.get("GroupId", "")
+                        gname = sg.get("GroupName", "")
+                        if gname:
+                            sg_str_elems.append(f"{gid} ({gname})")
+                        else:
+                            sg_str_elems.append(gid)
+                    security_groups_str = (
+                        "; ".join(sg_str_elems) if sg_str_elems else "None"
+                    )
+
+                    # --- 5. VOLUME ENCRYPTION (root + any unencrypted) ---
+                    block_mappings = instance.get("BlockDeviceMappings", [])
+                    root_device_name = instance.get("RootDeviceName")
+                    root_vol_id = None
+                    all_volume_ids = []
+
+                    for mapping in block_mappings:
+                        ebs = mapping.get("Ebs")
+                        if not ebs:
+                            continue
+                        vol_id = ebs.get("VolumeId")
+                        if not vol_id:
+                            continue
+                        all_volume_ids.append(vol_id)
+                        if mapping.get("DeviceName") == root_device_name:
+                            root_vol_id = vol_id
+
+                    # Default values
+                    root_volume_encrypted = "Unknown"
+                    any_unencrypted = "Unknown"
+
+                    if not block_mappings:
+                        root_volume_encrypted = "N/A"
+                        any_unencrypted = "N/A"
+                    else:
+                        if not vol_encrypted:
+                            # We couldn't build the cache (permissions or error)
+                            root_volume_encrypted = "Unknown"
+                            any_unencrypted = "Unknown"
+                        else:
+                            # Root volume
+                            if root_vol_id:
+                                if root_vol_id in vol_encrypted:
+                                    root_volume_encrypted = (
+                                        "YES"
+                                        if vol_encrypted[root_vol_id]
+                                        else "NO"
+                                    )
+                                else:
+                                    root_volume_encrypted = "Unknown"
+                            else:
+                                root_volume_encrypted = "N/A"
+
+                            # Any unencrypted volumes
+                            if not all_volume_ids:
+                                any_unencrypted = "N/A"
+                            else:
+                                saw_known = False
+                                saw_unencrypted = False
+                                for vid in all_volume_ids:
+                                    if vid in vol_encrypted:
+                                        saw_known = True
+                                        if not vol_encrypted[vid]:
+                                            saw_unencrypted = True
+                                            break
+                                if not saw_known:
+                                    any_unencrypted = "Unknown"
+                                else:
+                                    any_unencrypted = (
+                                        "YES" if saw_unencrypted else "NO"
+                                    )
+
+                    # --- 6. ELASTIC IP (from network interfaces) ---
+                    elastic_ips = []
+                    for ni in instance.get("NetworkInterfaces", []):
+                        assoc = ni.get("Association", {})
+                        if assoc.get("AllocationId") and assoc.get("PublicIp"):
+                            elastic_ips.append(assoc["PublicIp"])
+                    if elastic_ips:
+                        elastic_ip = ", ".join(sorted(set(elastic_ips)))
+                    else:
+                        elastic_ip = "None"
+
+                    # --- 7. METADATA / MONITORING / PUBLIC IP FLAG ---
+                    has_public_ip = (
+                        "YES"
+                        if instance.get("PublicIpAddress")
+                        else "NO"
+                    )
+                    monitoring_state = instance.get("Monitoring", {}).get(
+                        "State", "disabled"
+                    )
+                    http_tokens = instance.get("MetadataOptions", {}).get(
+                        "HttpTokens"
+                    )
+                    imdsv2_required = "YES" if http_tokens == "required" else "NO"
+
+                    # --- 8. COMPILE FULL DATA FOR JSON ---
+                    full_dump = {
+                        "Metadata": {
+                            "Region": region,
+                            "AnalysisTime": datetime.datetime.now().isoformat(),
+                            "ARN": arn,
+                        },
+                        "Instance": instance,  # The standard AWS response
+                        "Extended": {
+                            "UserData": user_data_decoded,
+                            "SystemStatus": system_status,
+                            "InstanceStatus": instance_status,
+                            "SecurityGroupsExpanded": sg_full_details,
+                            "RootVolumeEncrypted": root_volume_encrypted,
+                            "AnyUnencryptedVolumes": any_unencrypted,
+                            "ElasticIP": elastic_ip,
+                            "MonitoringState": monitoring_state,
+                            "IMDSv2Required": imdsv2_required,
+                        },
+                    }
+
+                    # Save to file
+                    filename = f"{region}_{safe_name}_{inst_id}"
+                    file_ref = save_instance_detail(filename, full_dump)
+                    file_str = str(file_ref)
+                    json_saved = "NO" if file_str.startswith("Error") else "YES"
+
+                    # --- 9. BUILD EXCEL ROW ---
+                    row = {
+                        "Instance Name": inst_name,
+                        "Instance ID": inst_id,
+                        "ARN": arn,
+                        "Region": region,
+                        "State": instance["State"]["Name"],
+                        "System Status": system_status,
+                        "Has User Data": "YES" if has_user_data else "NO",
+                        "Type": instance["InstanceType"],
+                        "Public IP": instance.get("PublicIpAddress", "N/A"),
+                        "Private IP": instance.get("PrivateIpAddress", "N/A"),
+                        "VPC ID": instance.get("VpcId", "N/A"),
+                        "Subnet ID": instance.get("SubnetId", "N/A"),
+                        "IAM Profile": instance.get(
+                            "IamInstanceProfile", {}
+                        ).get("Arn", "None").split("/")[-1],
+                        "Key Pair": instance.get("KeyName", "None"),
+                        "Platform": instance.get("Platform", "Linux/Unix"),
+                        "Launch Time": instance["LaunchTime"].replace(
+                            tzinfo=None
+                        ),
+                        "Volume Count": len(
+                            instance.get("BlockDeviceMappings", [])
+                        ),
+                        "Full Config File": file_ref,
+                        "Tags": "; ".join(tags_formatted),
+                    }
+
+                    # New columns (no extra API calls)
+                    row["JSON Saved"] = json_saved
+                    row["Has Public IP"] = has_public_ip
+                    row["Monitoring State"] = monitoring_state
+                    row["IMDSv2 Required"] = imdsv2_required
+                    row["Security Groups"] = security_groups_str
+                    row["Elastic IP"] = elastic_ip
+
+                    # New columns (volume cache)
+                    row["Root Volume Encrypted"] = root_volume_encrypted
+                    row["Any Unencrypted Volumes"] = any_unencrypted
+
+                    instance_rows.append(row)
+
+    except Exception as e:
+        if "AuthFailure" not in str(e):
+            print(f"[{region}] Loop Error: {e}")
+
+    return instance_rows
+
+
+def main():
+    start_time = time.time()
+    print(f"--- AWS EC2 Ultimate Inventory Audit ---")
+    print(f"1. Fetching Account Info...")
+
+    try:
+        account_id = get_account_id()
+        print(f"   Account ID: {account_id}")
+    except Exception as e:
+        print(f"CRITICAL: Could not verify credentials. {e}")
+        return
+
+    print(f"2. Detecting Regions...")
+    regions = get_all_regions()
+    print(f"   Found {len(regions)} enabled regions.")
+
+    print(f"3. Starting Deep Scan ({MAX_WORKERS} threads)...")
+    print(f"   (Note: Fetching 'User Data' adds a slight delay per instance)")
+
+    all_data = []
+    regions_processed = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_region = {
+            executor.submit(audit_region, r, account_id): r for r in regions
+        }
+
+        for future in as_completed(future_to_region):
+            r_name = future_to_region[future]
+            regions_processed += 1
+            try:
+                data = future.result()
+                all_data.extend(data)
+                print(
+                    f"\r   Progress: {regions_processed}/{len(regions)} regions scanned. (Found {len(data)} in {r_name})",
+                    end="",
+                )
+            except Exception as exc:
+                print(f"\n   [{r_name}] Exception: {exc}")
+
+    print("\n\n4. Compiling Final Report...")
+
+    if not all_data:
+        print("No instances found in any region.")
+        return
+
+    df = pd.DataFrame(all_data)
+
+    # Sort by Region then Name
+    df = df.sort_values(by=["Region", "Instance Name"])
+
+    # Organize Columns: Identifiers -> State -> Networking -> Config -> File Ref
+    cols = [
+        "Instance Name",
+        "Instance ID",
+        "ARN",
+        "Region",
+        "State",
+        "System Status",
+        "Has User Data",
+        "Full Config File",
+        "Public IP",
+        "Private IP",
+        "Type",
+        "VPC ID",
+        "IAM Profile",
+        "Launch Time",
+    ]
+    # Add whatever columns remain at the end
+    remaining = [c for c in df.columns if c not in cols]
+    df = df[cols + remaining]
+
+    try:
+        # Write detailed instances + summary into the same Excel file
+        with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
+            # Detailed instances sheet
+            df.to_excel(writer, index=False, sheet_name="Instances")
+
+            # ---- SUMMARY SHEET ----
+            metrics = [
+                {"Metric": "Total Instances", "Value": len(df)},
+                {
+                    "Metric": "Unique Regions",
+                    "Value": df["Region"].nunique(),
+                },
+            ]
+
+            if "Has Public IP" in df.columns:
+                metrics.append(
+                    {
+                        "Metric": "Instances with Public IP",
+                        "Value": (df["Has Public IP"] == "YES").sum(),
+                    }
+                )
+            if "Root Volume Encrypted" in df.columns:
+                metrics.append(
+                    {
+                        "Metric": "Instances with Root Volume Encrypted = NO",
+                        "Value": (df["Root Volume Encrypted"] == "NO").sum(),
+                    }
+                )
+            if "Any Unencrypted Volumes" in df.columns:
+                metrics.append(
+                    {
+                        "Metric": "Instances with Any Unencrypted Volumes = YES",
+                        "Value": (df["Any Unencrypted Volumes"] == "YES").sum(),
+                    }
+                )
+            if "IMDSv2 Required" in df.columns:
+                metrics.append(
+                    {
+                        "Metric": "Instances with IMDSv2 Required = NO",
+                        "Value": (df["IMDSv2 Required"] == "NO").sum(),
+                    }
+                )
+
+            summary_df = pd.DataFrame(metrics)
+            start_row = 0
+            summary_df.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False,
+                startrow=start_row,
+            )
+
+            # Instances by Region
+            start_row += len(summary_df) + 2
+            region_counts = (
+                df.groupby("Region")["Instance ID"]
+                .count()
+                .reset_index()
+                .rename(columns={"Instance ID": "Instance Count"})
+            )
+            region_counts.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False,
+                startrow=start_row,
+            )
+
+            # Instances by State
+            start_row += len(region_counts) + 2
+            state_counts = (
+                df.groupby("State")["Instance ID"]
+                .count()
+                .reset_index()
+                .rename(columns={"Instance ID": "Instance Count"})
+            )
+            state_counts.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False,
+                startrow=start_row,
+            )
+
+            # Instances by Type
+            start_row += len(state_counts) + 2
+            type_counts = (
+                df.groupby("Type")["Instance ID"]
+                .count()
+                .reset_index()
+                .rename(columns={"Instance ID": "Instance Count"})
+            )
+            type_counts = type_counts.sort_values(
+                "Instance Count", ascending=False
+            )
+            type_counts.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False,
+                startrow=start_row,
+            )
+
+        duration = time.time() - start_time
+        print(f"✅ SUCCESS.")
+        print(f"   Total Instances: {len(all_data)}")
+        print(f"   Excel Summary: {OUTPUT_EXCEL}")
+        print(f"   Detailed JSONs: {os.path.abspath(DATA_DIR)}")
+        print(f"   Time Taken: {round(duration, 2)} seconds")
+    except Exception as e:
+        print(f"❌ Error saving Excel: {e}")
+
+
+if __name__ == "__main__":
+    main()
